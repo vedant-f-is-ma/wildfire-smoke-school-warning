@@ -141,6 +141,8 @@ def render_folium_map(
 
     # Filter to selected date and merge
     day = county_daily[county_daily["Date Local"] == selected_date].copy()
+    if "Date Local" in day.columns:
+        day = day.drop(columns=["Date Local"])
     day_geo = counties_gdf.merge(day, on="fips", how="left")
 
     # Counties with no stations that day get zeros
