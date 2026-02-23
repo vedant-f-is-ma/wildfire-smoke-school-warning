@@ -168,7 +168,7 @@ def render_folium_map(
     tooltip_aliases = ["County FIPS", metric, "Warned sites", "Total sites"]
 
     folium.GeoJson(
-        day_geo,
+        day_geo.to_json(),
         name="CA Counties",
         style_function=style_fn,
         tooltip=folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, localize=True),
