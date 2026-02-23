@@ -1,96 +1,158 @@
-# Streamlit GIS app for wildfire-smoke school warnings.
-# Loads station-level predictions, aggregates to CA counties, and renders a date-driven choropleth with optional station overlays.
+# app.py
+# Streamlit GIS app: date/metric dropdown + CA county choropleth + optional station overlay for your school smoke warnings.
+# Designed to be cache-safe (no unhashable GeoDataFrame args in cached functions) and deployment-friendly.
 
-import pandas as pd
+from __future__ import annotations
+
+import io
+from typing import Optional, Tuple, Union
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Geospatial stack
 import geopandas as gpd
 from shapely.geometry import Point
+
+# Mapping stack
 import folium
 import branca.colormap as cm
-import streamlit as st
 from streamlit_folium import st_folium
 
+
 # -----------------------------
-# Config
+# App config
 # -----------------------------
 st.set_page_config(page_title="School Smoke Risk GIS", layout="wide")
 
-DEFAULT_CENTER = (37.55, -121.99)  # Fremont-ish
-DEFAULT_ZOOM = 6
+DEFAULT_CENTER_CA = (37.0, -119.5)          # California-ish
+DEFAULT_CENTER_BAY = (37.55, -121.99)        # Fremont-ish
+DEFAULT_ZOOM_CA = 6
+DEFAULT_ZOOM_BAY = 9
 
 COUNTIES_GEOJSON_URL = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
-BULLETIN_CSV = "school_smoke_bulletin_station_level.csv"  # put next to app.py
+
+DEFAULT_BULLETIN_CSV = "school_smoke_bulletin_station_level.csv"
+
 
 # -----------------------------
-# Helpers
+# Cached loaders (safe to cache)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def load_bulletin(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    # Normalize expected cols
-    df["Date Local"] = pd.to_datetime(df["Date Local"]).dt.date
-    for c in ["Latitude", "Longitude", "risk_prob", "warn_flag"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column in bulletin CSV: {c}")
+def load_bulletin_csv(file_like: Union[str, io.BytesIO]) -> pd.DataFrame:
+    """
+    Loads station-level bulletin CSV and normalizes columns.
+    This is cached because the input is hashable (path or uploaded bytes).
+    """
+    df = pd.read_csv(file_like)
+
+    # Normalize expected columns
+    required = {"Date Local", "Latitude", "Longitude", "risk_prob"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Bulletin CSV is missing columns: {sorted(missing)}")
+
+    df["Date Local"] = pd.to_datetime(df["Date Local"], errors="coerce").dt.date
+    df = df.dropna(subset=["Date Local", "Latitude", "Longitude", "risk_prob"]).copy()
+
+    df["Latitude"] = pd.to_numeric(df["Latitude"], errors="coerce")
+    df["Longitude"] = pd.to_numeric(df["Longitude"], errors="coerce")
+    df["risk_prob"] = pd.to_numeric(df["risk_prob"], errors="coerce").clip(0, 1)
+
+    # Optional columns
+    if "warn_flag" in df.columns:
+        df["warn_flag"] = pd.to_numeric(df["warn_flag"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["warn_flag"] = 0
+
+    # Helpful display columns (optional)
+    for col in ["County Name", "top_reasons"]:
+        if col not in df.columns:
+            df[col] = ""
 
     df = df.dropna(subset=["Latitude", "Longitude", "risk_prob"]).copy()
-    df["risk_prob"] = pd.to_numeric(df["risk_prob"], errors="coerce").clip(0, 1)
-    df["warn_flag"] = pd.to_numeric(df["warn_flag"], errors="coerce").fillna(0).astype(int)
     return df
 
-@st.cache_data(show_spinner=False)
+
+@st.cache_resource(show_spinner=False)
 def load_ca_counties() -> gpd.GeoDataFrame:
+    """
+    Loads CA counties geometry (FIPS prefix 06) as a GeoDataFrame.
+    Cached as a resource because it’s essentially static geometry.
+    """
     counties = gpd.read_file(COUNTIES_GEOJSON_URL)
-    # Filter to California (FIPS starts with "06")
     counties["fips"] = counties["id"].astype(str).str.zfill(5)
     counties = counties[counties["fips"].str.startswith("06")].copy()
     counties = counties.set_crs(epsg=4326, allow_override=True)
     return counties[["fips", "geometry"]]
 
-@st.cache_data(show_spinner=False)
+
+# -----------------------------
+# Non-cached geospatial compute (avoids Streamlit hashing issues)
+# -----------------------------
 def spatial_join_points_to_counties(df_points: pd.DataFrame, counties: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Spatially joins station points to CA counties.
+    Not cached (GeoDataFrame hashing is painful and the scale here is manageable).
+    """
     gdf_points = gpd.GeoDataFrame(
-        df_points,
-        geometry=[Point(xy) for xy in zip(df_points["Longitude"], df_points["Latitude"])],
+        df_points.copy(),
+        geometry=gpd.points_from_xy(df_points["Longitude"], df_points["Latitude"]),
         crs="EPSG:4326",
     )
+
     joined = gpd.sjoin(gdf_points, counties, how="left", predicate="within")
     joined = joined.dropna(subset=["fips"]).copy()
     return joined
 
+
 def aggregate_county_daily(joined: gpd.GeoDataFrame) -> pd.DataFrame:
-    # One row per county per day with metrics
-    out = (joined.groupby(["Date Local", "fips"], as_index=False)
-           .agg(
-               max_risk=("risk_prob", "max"),
-               avg_risk=("risk_prob", "mean"),
-               num_sites=("risk_prob", "count"),
-               num_warned=("warn_flag", "sum"),
-           ))
+    """
+    Aggregates station outputs into county-by-date metrics.
+    Output is a plain DataFrame (hashable-ish, easy to work with).
+    """
+    out = (
+        joined.groupby(["Date Local", "fips"], as_index=False)
+        .agg(
+            max_risk=("risk_prob", "max"),
+            avg_risk=("risk_prob", "mean"),
+            num_sites=("risk_prob", "count"),
+            num_warned=("warn_flag", "sum"),
+        )
+    )
     return out
 
-def render_map(counties_gdf: gpd.GeoDataFrame,
-               county_daily: pd.DataFrame,
-               stations_day: pd.DataFrame,
-               selected_date,
-               metric: str,
-               show_stations: bool,
-               center=DEFAULT_CENTER,
-               zoom=DEFAULT_ZOOM):
 
-    # Merge metrics onto county geometries for the day
+def render_folium_map(
+    counties_gdf: gpd.GeoDataFrame,
+    county_daily: pd.DataFrame,
+    stations_day: pd.DataFrame,
+    selected_date,
+    metric: str,
+    show_stations: bool,
+    zoom_bay: bool,
+) -> folium.Map:
+    """
+    Renders a folium choropleth map + optional station overlay for a selected date.
+    """
+    center = DEFAULT_CENTER_BAY if zoom_bay else DEFAULT_CENTER_CA
+    zoom = DEFAULT_ZOOM_BAY if zoom_bay else DEFAULT_ZOOM_CA
+
+    # Filter to selected date and merge
     day = county_daily[county_daily["Date Local"] == selected_date].copy()
     day_geo = counties_gdf.merge(day, on="fips", how="left")
 
-    # Fill NAs: counties with no monitors that day get 0
+    # Counties with no stations that day get zeros
     for col in ["max_risk", "avg_risk", "num_warned", "num_sites"]:
         if col in day_geo.columns:
             day_geo[col] = day_geo[col].fillna(0)
 
     m = folium.Map(location=center, zoom_start=zoom, tiles="cartodbpositron")
 
-    vmin = float(day_geo[metric].min())
-    vmax = float(day_geo[metric].max())
+    # Colormap
+    vmin = float(day_geo[metric].min()) if len(day_geo) else 0.0
+    vmax = float(day_geo[metric].max()) if len(day_geo) else 1.0
     if vmax <= vmin:
         vmax = vmin + 1e-6
 
@@ -100,107 +162,135 @@ def render_map(counties_gdf: gpd.GeoDataFrame,
 
     def style_fn(feat):
         val = feat["properties"].get(metric, 0) or 0
-        return {
-            "fillOpacity": 0.65,
-            "weight": 0.6,
-            "fillColor": colormap(val),
-        }
+        return {"fillOpacity": 0.65, "weight": 0.6, "fillColor": colormap(val)}
 
     tooltip_fields = ["fips", metric, "num_warned", "num_sites"]
     tooltip_aliases = ["County FIPS", metric, "Warned sites", "Total sites"]
 
     folium.GeoJson(
         day_geo,
+        name="CA Counties",
         style_function=style_fn,
         tooltip=folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, localize=True),
-        name="CA Counties"
     ).add_to(m)
 
     # Optional station overlay
     if show_stations and stations_day is not None and len(stations_day):
         for _, r in stations_day.iterrows():
-            # Size by risk; keep it sane
             radius = float(2 + 10 * np.clip(r["risk_prob"], 0, 1))
+            popup_bits = [
+                f"risk={float(r['risk_prob']):.2f}",
+                f"warn={int(r.get('warn_flag', 0))}",
+            ]
+            if "County Name" in stations_day.columns and r.get("County Name", ""):
+                popup_bits.insert(0, str(r["County Name"]))
+            if "top_reasons" in stations_day.columns and r.get("top_reasons", ""):
+                popup_bits.append(str(r["top_reasons"]))
+
             folium.CircleMarker(
-                location=[r["Latitude"], r["Longitude"]],
+                location=[float(r["Latitude"]), float(r["Longitude"])],
                 radius=radius,
                 fill=True,
                 fill_opacity=0.8,
                 weight=1,
-                popup=f"risk={r['risk_prob']:.2f} warn={int(r['warn_flag'])}"
+                popup=" | ".join(popup_bits),
             ).add_to(m)
 
     folium.LayerControl().add_to(m)
     return m
 
+
 # -----------------------------
-# App UI
+# UI
 # -----------------------------
 st.title("School Smoke Risk GIS")
-st.caption("County-level choropleth + optional station overlay. Built for school decision support (tomorrow warning).")
+st.caption("County choropleth + station overlay with date/metric controls. Built for operational decision support (schools).")
 
 with st.sidebar:
     st.header("Controls")
-    st.write("Upload a bulletin CSV or use the default next to app.py.")
-    uploaded = st.file_uploader("Bulletin CSV", type=["csv"])
-    show_stations = st.toggle("Show station points", value=True)
 
-    zoom_local = st.toggle("Zoom to Bay Area", value=False)
+    uploaded = st.file_uploader("Upload bulletin CSV", type=["csv"])
+    st.divider()
+
     metric = st.selectbox("Metric", ["max_risk", "avg_risk", "num_warned"], index=0)
+    show_stations = st.toggle("Show station points", value=True)
+    zoom_bay = st.toggle("Zoom to Bay Area", value=True)
+
+    st.divider()
+    st.write("Tip: If deploys get cranky, use Python 3.11 in your platform settings. Geospatial wheels are happiest there.")
 
 # Load data
-if uploaded is not None:
-    df_bulletin = load_bulletin(uploaded)
-else:
-    df_bulletin = load_bulletin(BULLETIN_CSV)
+try:
+    if uploaded is not None:
+        df_bulletin = load_bulletin_csv(uploaded)
+    else:
+        df_bulletin = load_bulletin_csv(DEFAULT_BULLETIN_CSV)
+except Exception as e:
+    st.error("Couldn’t load bulletin CSV. Confirm the file exists (or upload one) and has required columns.")
+    st.exception(e)
+    st.stop()
 
-counties = load_ca_counties()
-joined = spatial_join_points_to_counties(df_bulletin, counties)
-county_daily = aggregate_county_daily(joined)
+# Load counties
+try:
+    counties = load_ca_counties()
+except Exception as e:
+    st.error("Couldn’t load CA counties geometry. This is usually a geopandas/shapely install issue.")
+    st.exception(e)
+    st.stop()
+
+# Compute joins + aggregates (not cached to avoid unhashable GeoDataFrame args)
+try:
+    joined = spatial_join_points_to_counties(df_bulletin, counties)
+    county_daily = aggregate_county_daily(joined)
+except Exception as e:
+    st.error("Spatial processing failed (join/aggregate). Check that station coordinates are valid and within CA.")
+    st.exception(e)
+    st.stop()
 
 dates = sorted(county_daily["Date Local"].unique())
 if not dates:
-    st.error("No dates available after spatial join. Check that your stations are in CA and have valid lat/lon.")
+    st.warning("No mappable dates found after spatial join. Are your stations in California (lat/lon) and not missing?")
     st.stop()
 
-selected_date = st.selectbox("Select date", dates, index=len(dates)-1)
+selected_date = st.selectbox("Select date", dates, index=len(dates) - 1)
 
-# Station overlay table for that day
+# Station overlay for selected day
 stations_day = df_bulletin[df_bulletin["Date Local"] == selected_date].copy()
 
-# Center/zoom choice
-if zoom_local:
-    center = DEFAULT_CENTER
-    zoom = 9
-else:
-    center = (37.0, -119.5)  # CA-ish
-    zoom = 6
-
-# Render map
-m = render_map(
+# Render
+m = render_folium_map(
     counties_gdf=counties,
     county_daily=county_daily,
     stations_day=stations_day,
     selected_date=selected_date,
     metric=metric,
     show_stations=show_stations,
-    center=center,
-    zoom=zoom
+    zoom_bay=zoom_bay,
 )
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([2, 1], gap="large")
 
 with col1:
     st_folium(m, height=650, width=None)
 
 with col2:
     st.subheader("Day summary")
+
     day = county_daily[county_daily["Date Local"] == selected_date].copy()
-    st.metric("Counties with any warnings", int((day["num_warned"] > 0).sum()))
-    st.metric("Total warned sites", int(day["num_warned"].sum()))
-    st.metric("Max county risk", float(day["max_risk"].max()) if len(day) else 0.0)
+    counties_with_warn = int((day["num_warned"] > 0).sum()) if len(day) else 0
+    total_warned_sites = int(day["num_warned"].sum()) if len(day) else 0
+    max_county_risk = float(day["max_risk"].max()) if len(day) else 0.0
+
+    st.metric("Counties with warnings", counties_with_warn)
+    st.metric("Total warned sites", total_warned_sites)
+    st.metric("Max county risk", round(max_county_risk, 3))
 
     st.subheader("Top stations by risk")
     top = stations_day.sort_values("risk_prob", ascending=False).head(15)
-    show_cols = [c for c in ["County Name","Latitude","Longitude","risk_prob","warn_flag","top_reasons"] if c in top.columns]
-    st.dataframe(top[show_cols], use_container_width=True)
+    cols = [c for c in ["County Name", "risk_prob", "warn_flag", "top_reasons", "Latitude", "Longitude"] if c in top.columns]
+    st.dataframe(top[cols], use_container_width=True)
+
+    with st.expander("Data QA"):
+        st.write("Bulletin rows:", len(df_bulletin))
+        st.write("Joined rows (in CA counties):", len(joined))
+        st.write("Dates available:", len(dates))
